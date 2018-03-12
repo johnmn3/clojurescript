@@ -389,10 +389,11 @@
   ([stacktrace opts]
    (doseq [{:keys [function file line column]}
            (mapped-stacktrace stacktrace opts)]
-     (err-out
-       (println "\t"
-         (str (when function (str function " "))
-           "(" (file-display file opts) (when line (str ":" line)) (when column (str ":" column)) ")"))))))
+     (when-not (= file "NO_SOURCE_FILE")
+       (err-out
+         (println "\t"
+           (str (when function (str function " "))
+             "(" (file-display file opts) (when line (str ":" line)) (when column (str ":" column)) ")")))))))
 
 (comment
   (def st (env/default-compiler-env))
