@@ -17,7 +17,8 @@
                  [com.cognitect/transit-clj "0.8.300"]
                  [org.clojure/google-closure-library "0.0-20170809-b9c14c6b"]
                  [com.google.javascript/closure-compiler-unshaded "v20180204"]
-                 [org.mozilla/rhino "1.7R5"]]
+                 [org.mozilla/rhino "1.7R5"]
+                 [org.java-websocket/Java-WebSocket "1.3.8"]]
   :profiles {:1.6 {:dependencies [[org.clojure/clojure "1.6.0"]]}
              :uberjar {:aot :all :main cljs.main}
              :closure-snapshot {:dependencies [[com.google.javascript/closure-compiler-unshaded "1.0-SNAPSHOT"]]}}

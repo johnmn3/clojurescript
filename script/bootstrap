@@ -12,6 +12,7 @@ GCLOSURE_LIB_RELEASE="0.0-20170809-b9c14c6b"
 RHINO_RELEASE="1_7R5"
 TREADER_RELEASE="1.3.0-alpha3"
 TEST_CHECK_RELEASE="0.10.0-alpha2"
+JAVA_WEBSOCKET_RELEASE="1.3.8"
 
 # check dependencies
 curl -V >/dev/null  || { echo "cURL is missing, or not on your system path."; exit 1; }
@@ -55,6 +56,13 @@ echo "Copying transit-clj-$TRANSIT_RELEASE.jar to lib/transit-clj-$TRANSIT_RELEA
 cp transit-clj-$TRANSIT_RELEASE.jar lib/transit-clj-$TRANSIT_RELEASE.jar
 echo "Cleaning up transit-clj..."
 rm transit-clj-$TRANSIT_RELEASE.jar
+
+echo "Fetching Java-WebSocket..."
+curl --retry 3 -O -s https://repo1.maven.org/maven2/org/java-websocket/Java-WebSocket/$JAVA_WEBSOCKET_RELEASE/Java-WebSocket-$JAVA_WEBSOCKET_RELEASE.jar || { echo "Download failed."; exit 1; }
+echo "Copying Java-WebSocket-$TRANSIT_RELEASE.jar to lib/Java-WebSocket-$TRANSIT_RELEASE.jar..."
+cp Java-WebSocket-$JAVA_WEBSOCKET_RELEASE.jar lib/Java-WebSocket-$JAVA_WEBSOCKET_RELEASE.jar
+echo "Cleaning up Java-WebSocket..."
+rm Java-WebSocket-$JAVA_WEBSOCKET_RELEASE.jar
 
 echo "Fetching Google Closure library..."
 mkdir -p closure/library
