@@ -13,9 +13,11 @@
             [cljs.env :as env]
             [cljs.analyzer :as a]
             [cljs.analyzer.api :as ana-api]
+            [cljs.compiler :as comp]
             [cljs.closure :as closure]
             [cljs.externs :as externs]
-            [cljs.analyzer :as ana])
+            [cljs.analyzer :as ana]
+            [clojure.string :as string])
   (:use clojure.test))
 
 (defn collecting-warning-handler [state]
@@ -854,156 +856,131 @@
           ))))
   )
 
-(comment
-  (require '[cljs.compiler :as cc])
-  (require '[cljs.closure :as closure])
+(defn infer-test-helper [{:keys [forms externs warnings warn]}]
+  (let [test-cenv (atom {::a/externs
+                         (externs/externs-map
+                           (closure/load-externs {:externs (or externs [])}))})]
+    (a/with-warning-handlers [(collecting-warning-handler (or warnings (atom [])))]
+      (binding [a/*cljs-ns* a/*cljs-ns*
+                a/*cljs-warnings* (assoc a/*cljs-warnings*
+                                    :infer-warning (if (nil? warn) true warn))]
+        (e/with-compiler-env test-cenv
+          (a/analyze-form-seq forms)
+          (with-out-str
+            (comp/emit-externs
+              (reduce util/map-merge {}
+                (map (comp :externs second)
+                  (get @test-cenv ::a/namespaces))))))))))
 
-  (let [test-cenv (atom {::a/externs (externs/externs-map)})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(ns foo.core)
-            (defn bar [a] (js/parseInt a))
-            (def c js/React.Component)
-            (js/console.log "Hello world!")
-            (fn [& args]
-              (.apply (.-log js/console) js/console (into-array args)))
-            (js/console.log js/Number.MAX_VALUE)
-            (js/console.log js/Symbol.iterator)])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-basic-infer
+  (let [res (infer-test-helper
+              {:forms '[(ns foo.core)
+                        (defn bar [a] (js/parseInt a))
+                        (def c js/React.Component)
+                        (js/console.log "Hello world!")
+                        (fn [& args]
+                          (.apply (.-log js/console) js/console (into-array args)))
+                        (js/console.log js/Number.MAX_VALUE)
+                        (js/console.log js/Symbol.iterator)]})]
+    (is (= "var React;\nReact.Component;\n" res))))
 
-  (let [test-cenv (atom {::a/externs (externs/externs-map)})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(defn foo [^js/React.Component c]
-              (.render c))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-method-infer
+  (let [res (infer-test-helper
+              {:forms '[(defn foo [^js/React.Component c]
+                          (.render c))]})]
+    (is (= "var React;\nReact.Component;\nReact.Component.prototype.render;\n"
+           res))))
 
-  ;; works, does not generate extern
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(js/console.log (.wozMethod (js/baz)))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-minimal-infer
+  (let [res (infer-test-helper
+              {:forms '[(js/console.log (.wozMethod (js/baz)))]
+               :externs ["src/test/externs/test.js"]})]
+    (is (string/blank? res))))
 
-  ;; works, does not generate extern
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(defn afun [^js/Foo x]
-              (.wozMethod x))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-type-hint-minimal-infer
+  (let [res (infer-test-helper
+              {:forms ''[(defn afun [^js/Foo x]
+                           (.wozMethod x))]
+               :externs ["src/test/externs/test.js"]})]
+    (is (string/blank? res))))
 
-  ;; FIXME: generates externs we know about including the one we don't
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(defn afun [^js/Foo.Bar x]
-              (let [z (.baz x)]
-                (.wozz z)))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-type-hint-infer-unknown-method-in-chain
+  (let [ws  (atom [])
+        res (infer-test-helper
+              {:forms '[(defn afun [^js/Foo.Bar x]
+                          (let [z (.baz x)]
+                            (.wozz z)))]
+               :externs ["src/test/externs/test.js"]
+               :warnings ws})]
+    (is (= "Foo.Boo.prototype.wozz;\n" res))
+    (is (= 1 (count @ws)))
+    (is (string/starts-with?
+          (first @ws)
+          "Cannot resolve property wozz for inferred type js/Foo.Boo"))))
 
-  ;; works, generates extern
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(defn baz [^js/Foo a]
-              (.gozMethod a))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-type-hint-infer-unknown-property-in-chain
+  (let [ws  (atom [])
+        res (infer-test-helper
+              {:forms '[(defn afun [^js/Foo.Bar x]
+                          (let [z (.baz x)]
+                            (.-wozz z)))]
+               :externs ["src/test/externs/test.js"]
+               :warnings ws})]
+    (is (= "Foo.Boo.prototype.wozz;\n" res))
+    (is (= 1 (count @ws)))
+    (is (string/starts-with?
+          (first @ws)
+          "Cannot resolve property wozz for inferred type js/Foo.Boo"))))
 
-  ;; works, generates extern
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(.gozMethod (js/baz))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-type-hint-infer-unknown-method
+  (let [ws  (atom [])
+        res (infer-test-helper
+              {:forms '[(defn baz [^js/Foo a]
+                           (.gozMethod a))]
+               :externs ["src/test/externs/test.js"]
+               :warnings ws})]
+    (is (= "Foo.prototype.gozMethod;\n" res))
+    (is (= 1 (count @ws)))
+    (is (string/starts-with?
+          (first @ws)
+          "Cannot resolve property gozMethod for inferred type js/Foo"))))
 
-  ;; known extern
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(.gozMethod (js/baz))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-infer-unknown-method-from-externs
+  (let [ws  (atom [])
+        res (infer-test-helper
+              {:forms '[(.gozMethod (js/baz))]
+               :externs ["src/test/externs/test.js"]
+               :warnings ws})]
+    (is (= "Foo.prototype.gozMethod;\n" res))
+    (is (= 1 (count @ws)))
+    (is (string/starts-with?
+          (first @ws)
+          "Cannot resolve property gozMethod for inferred type js/Foo"))))
 
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(fn [^js/Foo.Bar x]
-              (let [z (.baz x)]
-                (.-wozz z)))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
+(deftest test-infer-js-require
+  (let [ws  (atom [])
+        res (infer-test-helper
+              {:forms '[(ns foo.core)
+                        (def React (js/require "react"))
+                        (.log js/console (.-Component React))]
+               :externs ["src/test/externs/test.js"]
+               :warnings ws})]
+    (is (= "var require;\nObject.Component;\n" res))
+    (is (= 1 (count @ws)))
+    (is (string/starts-with?
+          (first @ws)
+          "Adding extern to Object for property Component"))))
 
-  (let [test-cenv (atom {::a/externs (externs/externs-map
-                                       (closure/load-externs
-                                         {:externs ["src/test/externs/test.js"]}))})]
-    (binding [a/*cljs-ns* a/*cljs-ns*
-              a/*cljs-warnings* (assoc a/*cljs-warnings* :infer-warning true)]
-      (e/with-compiler-env test-cenv
-        (a/analyze-form-seq
-          '[(ns foo.core)
-            (def React (js/require "react"))
-            (.log js/console (.-Component React))])
-        (cc/emit-externs
-          (reduce util/map-merge {}
-            (map (comp :externs second)
-              (get @test-cenv ::a/namespaces)))))))
-
-  )
+(deftest test-set-warn-on-infer
+  (let [ws  (atom [])
+        res (infer-test-helper
+              {:forms '[(ns warn-on-infer-test.app)
+                        (set! *warn-on-infer* true)
+                        (defn wrap-baz [x]
+                          (.baz x))]
+               :externs ["src/test/externs/test.js"]
+               :warnings ws
+               :warn false})]
+    (is (string/blank? res))
+    (is (= 1 (count @ws)))
+    (is (string/starts-with? (first @ws) "Cannot infer target type"))))

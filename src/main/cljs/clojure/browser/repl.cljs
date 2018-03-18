@@ -18,6 +18,7 @@
   (:require [goog.dom :as gdom]
             [goog.object :as gobj]
             [goog.array :as garray]
+            [goog.json :as json]
             [goog.userAgent.product :as product]
             [clojure.browser.net :as net]
             [clojure.browser.event :as event]
@@ -30,13 +31,17 @@
 (goog-define HOST "localhost")
 (goog-define PORT 9000)
 
+(def ^:dynamic *repl* nil)
 (def xpc-connection (atom nil))
 (def parent-connected? (atom false))
 (def print-queue (array))
 
 (defn flush-print-queue! [conn]
   (doseq [str print-queue]
-    (net/transmit conn :print str))
+    (net/transmit conn :print
+      (json/serialize
+        #js {"repl" *repl*
+             "str"  str})))
   (garray/clear print-queue))
 
 (defn repl-print [data]
@@ -91,8 +96,12 @@
 
 (def order (atom 0))
 
-(defn wrap-message [t data]
-  (pr-str {:type t :content data :order (swap! order inc)}))
+(defn wrap-message [repl t data]
+  (pr-str
+    {:repl repl
+     :type t
+     :content data
+     :order (swap! order inc)}))
 
 (defn start-evaluator
   "Start the REPL server connection."
@@ -109,8 +118,7 @@
                             ;; ack once.
                             (js/setTimeout try-handshake
                                            10)))]
-      (net/connect repl-connection
-                   try-handshake)
+      (net/connect repl-connection try-handshake)
 
       (net/register-service repl-connection
         :ack-handshake
@@ -120,8 +128,7 @@
             ;; Now that we're connected to the parent, we can start talking to
             ;; the server.
             (send-result connection
-                         url
-                         (wrap-message :ready "ready")))))
+              url (wrap-message nil :ready "ready")))))
 
       (event/listen connection
         :success
@@ -129,18 +136,24 @@
           (net/transmit
             repl-connection
             :evaluate-javascript
-            (.getResponseText (.-currentTarget e)
-              ()))))
+            (.getResponseText (.-currentTarget e) ()))))
 
       (net/register-service repl-connection
         :send-result
-        (fn [data]
-          (send-result connection url (wrap-message :result data))))
+        (fn [json]
+          (let [obj    (json/parse json)
+                repl   (gobj/get obj "repl")
+                result (gobj/get obj "result")]
+            (send-result connection url
+              (wrap-message repl :result result)))))
 
       (net/register-service repl-connection
         :print
-        (fn [data]
-          (send-print url (wrap-message :print data)))))
+        (fn [json]
+          (let [obj  (json/parse json)
+                repl (gobj/get obj "repl")
+                str  (gobj/get obj "str")]
+            (send-print url (wrap-message repl :print str))))))
     (js/alert "No 'xpc' param provided to child iframe.")))
 
 (def load-queue nil)
@@ -228,11 +241,18 @@
           (flush-print-queue! repl-connection))))
     (net/register-service repl-connection
       :evaluate-javascript
-      (fn [js]
-        (net/transmit
-          repl-connection
-          :send-result
-          (evaluate-javascript repl-connection js))))
+      (fn [json]
+        (let [obj  (json/parse json)
+              repl (gobj/get obj "repl")
+              form (gobj/get obj "form")]
+          (net/transmit
+            repl-connection
+            :send-result
+            (json/serialize
+              #js {"repl" repl
+                   "result"
+                   (binding [*repl* repl]
+                     (evaluate-javascript repl-connection form))})))))
     (net/connect repl-connection
       (constantly nil)
       (fn [iframe]

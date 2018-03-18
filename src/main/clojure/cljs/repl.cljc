@@ -190,50 +190,55 @@
      (assoc :output-dir
             (or (:output-dir opts) (get repl-env :working-dir ".repl"))))))
 
+(defn add-url [ijs]
+  (cond-> ijs
+    (not (contains? ijs :url))
+    (assoc :url (io/resource (:file ijs)))))
+
+(defn ns->input [ns opts]
+  (if-let [input (some-> (util/ns->source ns) (ana/parse-ns opts))]
+    input
+    (if-let [input (some->
+                     (get-in @env/*compiler*
+                       [:js-dependency-index (str ns)])
+                     add-url)]
+      input
+      (throw
+        (ex-info (str ns " does not exist")
+          {::error :invalid-ns})))))
+
+(defn compilable? [input]
+  (contains? input :source-file))
+
 (defn load-namespace
   "Load a namespace and all of its dependencies into the evaluation environment.
   The environment is responsible for ensuring that each namespace is loaded once and
   only once."
   ([repl-env ns] (load-namespace repl-env ns nil))
   ([repl-env ns opts]
-   (let [ns (if (and (seq? ns)
-                     (= (first ns) 'quote))
-               (second ns)
-               ns)
-         ;; TODO: add pre-condition to source-on-disk, the
-         ;; source must supply at least :url - David
-         sources (binding [ana/*analyze-deps* false]
-                   (cljsc/add-dependencies
-                     (merge (env->opts repl-env) opts)
-                     {:requires [(name ns)] :type :seed}))
-         deps (->> sources
-                (remove (comp #{["goog"]} :provides))
-                (remove (comp #{:seed} :type))
-                (map #(select-keys % [:provides :url])))]
-     (cljsc/handle-js-modules opts sources env/*compiler*)
+   (let [ns (if (and (seq? ns) (= (first ns) 'quote)) (second ns) ns)
+         input (ns->input ns opts)
+         sources (if (compilable? input)
+                   (->> (cljsc/compile-inputs [input]
+                          (merge (env->opts repl-env) opts))
+                     (remove (comp #{["goog"]} :provides)))
+                   (map #(cljsc/source-on-disk opts %)
+                     (cljsc/add-js-sources [input] opts)))]
+     (when (:repl-verbose opts)
+       (println (str "load-namespace " ns " , compiled:") (map :provides sources)))
      (if (:output-dir opts)
        ;; REPLs that read from :output-dir just need to add deps,
        ;; environment will handle actual loading - David
        (let [sb (StringBuffer.)]
-         (doseq [source (->> sources
-                          (remove (comp #{:seed} :type))
-                          (map #(cljsc/source-on-disk opts %)))]
-           (when (:repl-verbose opts)
-             (println "Loading:" (:provides source)))
-           ;; Need to get :requires and :provides from compiled source
-           ;; not from our own compilation, this issue oddly doesn't seem to
-           ;; affect compiled ClojureScript, should be cleaned up so we
-           ;; don't need this step here - David
+         (doseq [source sources]
            (with-open [rdr (io/reader (:url source))]
              (.append sb
-               (cljsc/add-dep-string opts
-                 (merge source
-                   (deps/parse-js-ns (line-seq rdr)))))))
+               (cljsc/add-dep-string opts source))))
          (when (:repl-verbose opts)
            (println (.toString sb)))
          (-evaluate repl-env "<cljs repl>" 1 (.toString sb)))
        ;; REPLs that stream must manually load each dep - David
-       (doseq [{:keys [url provides]} deps]
+       (doseq [{:keys [url provides]} sources]
          (-load repl-env provides url))))))
 
 (defn- load-dependencies
@@ -336,7 +341,7 @@
       {:function name'
        :call     call
        :file     (if no-source-file?
-                   (str "NO_SOURCE_FILE"
+                   (str "<NO_SOURCE_FILE>"
                         (when file
                           (str " " file)))
                    (io/file file'))
@@ -378,8 +383,12 @@
 (defn file-display
   [file {:keys [output-dir temp-output-dir?]}]
   (if temp-output-dir?
-    (let [canonicalize (fn [file] (.getCanonicalPath (io/file file)))]
-      (subs (canonicalize file) (inc (count (canonicalize output-dir)))))
+    (let [canonicalize (fn [file] (.getCanonicalPath (io/file file)))
+          can-file (canonicalize file)
+          can-out (canonicalize output-dir)]
+      (if (.startsWith can-file can-out)
+        (subs can-file (inc (count can-out)))
+        (subs can-file (inc (.lastIndexOf can-file java.io.File/separator)))))
     file))
 
 (defn print-mapped-stacktrace
@@ -499,8 +508,11 @@
            ast (->ast form)
            ast (if-not (#{:ns :ns*} (:op ast))
                  ast
-                 (let [ijs (ana/parse-ns [form])] ;; if ns form need to check for js modules - David
-                   (cljsc/handle-js-modules opts [ijs] env/*compiler*)
+                 (let [ijs (ana/parse-ns [form])]
+                   (cljsc/handle-js-modules opts
+                     (deps/dependency-order
+                       (cljsc/add-dependency-sources [ijs] opts))
+                     env/*compiler*)
                    (binding [ana/*check-alias-dupes* false]
                      (ana/no-warn (->ast form))))) ;; need new AST after we know what the modules are - David
            wrap-js
@@ -844,7 +856,7 @@
                   caught repl-caught
                   reader #(readers/source-logging-push-back-reader
                            *in*
-                           1 "NO_SOURCE_FILE")
+                           1 "<NO_SOURCE_FILE>")
                   print-no-newline print
                   source-map-inline true
                   repl-requires '[[cljs.repl :refer-macros [source doc find-doc apropos dir pst]]

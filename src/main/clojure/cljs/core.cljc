@@ -3017,21 +3017,18 @@
                            ([~restarg]
                             (let [~@(mapcat param-bind params)]
                               (this-as self#
-                                (if (identical? js/Function (type self#))
-                                  (. self# (~(get-delegate) ~@params ~restarg))
-                                  (. ~sym (~(get-delegate) ~@params ~restarg))))))))
+                                (. self# (~(get-delegate) ~@params ~restarg)))))))
                       `(fn
                          ([~restarg]
                           (this-as self#
-                            (if (identical? js/Function (type self#))
-                              (. self# (~(get-delegate) (seq ~restarg)))
-                              (. ~sym (~(get-delegate) (seq ~restarg)))))))))]
+                            (. self# (~(get-delegate) (seq ~restarg))))))))]
        `(do
           (set! (. ~sym ~(get-delegate-prop))
             (fn (~(vec sig) ~@body)))
           ~@(core/when solo
               `[(set! (. ~sym ~'-cljs$lang$maxFixedArity)
                   ~(core/dec (count sig)))])
+          (js-inline-comment " @this {Function} ")
           (set! (. ~sym ~'-cljs$lang$applyTo)
             ~(apply-to)))))))
 
@@ -3064,10 +3061,7 @@
                (let [argseq# (when (< ~c-1 (alength args#))
                                (new ^::ana/no-resolve cljs.core/IndexedSeq
                                  (.slice args# ~c-1) 0 nil))]
-                 (this-as self#
-                   (if (identical? js/Function (type self#))
-                     (. self# (~'cljs$core$IFn$_invoke$arity$variadic ~@(dest-args c-1) argseq#))
-                     (. ~rname (~'cljs$core$IFn$_invoke$arity$variadic ~@(dest-args c-1) argseq#))))))))
+                 (. ~rname (~'cljs$core$IFn$_invoke$arity$variadic ~@(dest-args c-1) argseq#))))))
          ~(variadic-fn* rname method)
          ~(core/when emit-var? `(var ~name))))))
 

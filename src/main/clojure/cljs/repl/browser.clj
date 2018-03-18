@@ -22,11 +22,12 @@
             [cljs.stacktrace :as st]
             [cljs.analyzer :as ana]
             [cljs.build.api :as build])
-  (:import [java.util.concurrent Executors]))
+  (:import [java.util.concurrent Executors ConcurrentHashMap]))
 
 (def ^:dynamic browser-state nil)
 (def ^:dynamic ordering nil)
 (def ^:dynamic es nil)
+(def outs (ConcurrentHashMap.))
 
 (def ext->mime-type
   {".html" "text/html"
@@ -70,7 +71,11 @@
     (send-for-eval @(server/connection) form return-value-fn))
   ([conn form return-value-fn]
     (set-return-value-fn return-value-fn)
-    (server/send-and-close conn 200 form "text/javascript")))
+    (server/send-and-close conn 200
+      (json/write-str
+        {"repl" (.getName (Thread/currentThread))
+         "form" form})
+      "application/json")))
 
 (defn- return-value
   "Called by the server when a return value is received."
@@ -235,11 +240,12 @@
   (send-via es ordering add-in-order order f)
   (send-via es ordering run-in-order))
 
-(defmethod handle-post :print [{:keys [content order]} conn _]
+(defmethod handle-post :print [{:keys [repl content order]} conn _]
   (constrain-order order
     (fn []
-      (print (read-string content))
-      (.flush *out*)))
+      (binding [*out* (or (and repl (.get outs repl)) *out*)]
+        (print (read-string content))
+        (.flush *out*))))
   (server/send-and-close conn 200 "ignore__"))
 
 (defmethod handle-post :result [{:keys [content order]} conn _]
@@ -290,6 +296,23 @@
 
 (def lock (Object.))
 
+(defn- waiting-to-connect-message [url]
+  (print-str "Waiting for browser to connect to" url "..."))
+
+(defn- maybe-browse-url [base-url]
+  (try
+    (browse/browse-url (str base-url "?rel=" (System/currentTimeMillis)))
+    (catch Throwable t
+      (if-some [error-message (not-empty (.getMessage t))]
+        (println "Failed to launch a browser:\n" error-message "\n")
+        (println "Could not launch a browser.\n"))
+      (println "You can instead launch a non-browser REPL (Node or Nashorn).\n")
+      (println "You can disable automatic browser launch with this REPL option")
+      (println "  :launch-browser false")
+      (println "and you can specify the listen IP address with this REPL option")
+      (println "  :host \"127.0.0.1\"\n")
+      (println (waiting-to-connect-message base-url)))))
+
 (defn setup [{:keys [working-dir launch-browser server-state] :as repl-env} {:keys [output-dir] :as opts}]
   (locking lock
     (when-not (:socket @server-state)
@@ -318,8 +341,9 @@
         (server/start repl-env)
         (let [base-url (str "http://" (:host repl-env) ":" (:port repl-env))]
           (if launch-browser
-            (browse/browse-url (str base-url "?rel=" (System/currentTimeMillis)))
-            (println "Waiting for browser to connect to" base-url "..."))))))
+            (maybe-browse-url base-url)
+            (println (waiting-to-connect-message base-url)))))))
+  (.put outs (.getName (Thread/currentThread)) *out*)
   (swap! server-state update :listeners inc))
 
 (defrecord BrowserEnv []
@@ -335,6 +359,7 @@
   (-load [this provides url]
     (load-javascript this provides url))
   (-tear-down [this]
+    (.remove outs (.getName (Thread/currentThread)))
     (let [server-state (:server-state this)]
       (when (zero? (:listeners (swap! server-state update :listeners dec)))
         (binding [server/state server-state] (server/stop))

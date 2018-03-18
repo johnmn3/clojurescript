@@ -11510,3 +11510,18 @@ reduces them without incurring seq initialization"
           (.println (.-error system) (.join (into-array args) "")))))))
 
 (maybe-enable-print!)
+
+(defonce
+  ^{:doc "Runtime environments may provide a way to evaluate ClojureScript
+  forms. Whatever function *eval* is bound to will be passed any forms which
+  should be evaluated." :dynamic true}
+  *eval*
+  (fn [_]
+    (throw (ex-info "cljs.core/*eval* not bound" {}))))
+
+(defn eval
+  "Evaluates the form data structure (not text!) and returns the result.
+  Delegates to cljs.core/*eval*. Intended for use in self-hosted ClojureScript,
+  which sets up an implementation of cljs.core/*eval* for that environment."
+  [form]
+  (*eval* form))
