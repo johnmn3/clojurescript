@@ -1093,7 +1093,7 @@
 
        (or fn? js? goog?)
        (emits f "(" (comma-sep args)  ")")
-       
+
        :else
        (if (and ana/*cljs-static-fns* (= (:op f) :var))
          ;; higher order case, static information missing
@@ -1442,11 +1442,11 @@
 
 #?(:clj
    (defn compile-file*
-     ([src dest]
+     ([^File src ^File dest]
       (compile-file* src dest
         (when env/*compiler*
           (:options @env/*compiler*))))
-     ([src dest opts]
+     ([^File src ^File dest opts]
       (ensure
         (with-core-cljs opts
           (fn []
@@ -1459,11 +1459,12 @@
               (let [ext (util/ext src)
                    {:keys [ns] :as ns-info} (ana/parse-ns src)]
                (if-let [cached (cached-core ns ext opts)]
-                 (emit-cached-core src dest cached opts)
+                 [(emit-cached-core src dest cached opts) false]
                  (let [opts (if (macro-ns? ns ext opts)
                               (assoc opts :macros-ns true)
                               opts)
-                       ret (emit-source src dest ext opts)]
+                       dest-exists? (.exists dest)
+                       ret [(emit-source src dest ext opts) dest-exists?]]
                    (.setLastModified ^File dest (util/last-modified src))
                    ret))))))))))
 
@@ -1476,24 +1477,22 @@
           (:options @env/*compiler*))))
      ([^File src ^File dest opts]
       (let [{:keys [ns requires]} (ana/parse-ns src)]
-        (if (and (= 'cljs.loader ns) (not (contains? opts :cache-key)))
-          false
-          (ensure
-           (or (not (.exists dest))
-               (util/changed? src dest)
-               (let [version' (util/compiled-by-version dest)
-                     version (util/clojurescript-version)]
-                 (and version (not= version version')))
-               (and opts
-                    (not (and (io/resource "cljs/core.aot.js") (= 'cljs.core ns)))
-                    (not= (ana/build-affecting-options opts)
-                          (ana/build-affecting-options (util/build-options dest))))
-               (and opts (:source-map opts)
-                 (if (= (:optimizations opts) :none)
-                   (not (.exists (io/file (str (.getPath dest) ".map"))))
-                   (not (get-in @env/*compiler* [::compiled-cljs (.getAbsolutePath dest)]))))
-               (when-let [recompiled' (and *recompiled* @*recompiled*)]
-                 (some requires recompiled')))))))))
+        (ensure
+         (or (not (.exists dest))
+             (util/changed? src dest)
+             (let [version' (util/compiled-by-version dest)
+                   version (util/clojurescript-version)]
+               (and version (not= version version')))
+             (and opts
+                  (not (and (io/resource "cljs/core.aot.js") (= 'cljs.core ns)))
+                  (not= (ana/build-affecting-options opts)
+                        (ana/build-affecting-options (util/build-options dest))))
+             (and opts (:source-map opts)
+                  (if (= (:optimizations opts) :none)
+                    (not (.exists (io/file (str (.getPath dest) ".map"))))
+                    (not (get-in @env/*compiler* [::compiled-cljs (.getAbsolutePath dest)]))))
+             (when-let [recompiled' (and *recompiled* @*recompiled*)]
+               (some requires recompiled'))))))))
 
 #?(:clj
    (defn compile-file
@@ -1545,8 +1544,9 @@
                                (not= 'cljs.core ns)
                                (not= :interactive (:mode opts)))
                       (swap! env/*compiler* update-in [::ana/namespaces] dissoc ns))
-                    (let [ret (compile-file* src-file dest-file opts)]
-                      (when *recompiled*
+                    (let [[ret recompiled?] (compile-file* src-file dest-file opts)]
+                      (when (and *recompiled*
+                                 recompiled?)
                         (swap! *recompiled* conj ns))
                       ret))
                   (do
