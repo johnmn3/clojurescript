@@ -541,7 +541,7 @@
   IJavaScript."
   [^File file {:keys [output-file] :as opts}]
     (if output-file
-      (let [out-file (io/file (util/output-directory opts) output-file)]
+      (let [out-file (.toString (io/file (util/output-directory opts) output-file))]
         (compiled-file (comp/compile-file file out-file opts)))
       (let [path (.getPath ^File file)]
         (binding [ana/*cljs-file* path]
@@ -658,6 +658,12 @@
   (-compile [this opts] (compile-form-seq this))
   (-find-sources [this opts]
     [(ana/parse-ns this opts)])
+
+  clojure.lang.IPersistentSet
+  (-compile [this opts]
+    (doall (map (comp #(-compile % opts) util/ns->source) this)))
+  (-find-sources [this opts]
+    (into [] (mapcat #(-find-sources % opts)) this))
   )
 
 (comment
@@ -2689,7 +2695,10 @@
   (compile-inputs (find-sources ns opts) opts))
 
 (defn build
-  "Given a source which can be compiled, produce runnable JavaScript."
+  "Given compiler options, produce runnable JavaScript. An optional source
+   parameter may be provided."
+  ([opts]
+   (build nil opts))
   ([source opts]
     (build source opts
       (if-not (nil? env/*compiler*)
@@ -2777,7 +2786,9 @@
                  ;; reset :js-module-index so that ana/parse-ns called by -find-sources
                  ;; can find the missing JS modules
                  js-sources (env/with-compiler-env (dissoc @compiler-env :js-module-index)
-                              (-> (-find-sources source opts)
+                              (-> (if source
+                                    (-find-sources source opts)
+                                    (-find-sources (reduce into #{} (map (comp :entries val) (:modules opts))) opts))
                                   (add-dependency-sources compile-opts)))
                  opts       (handle-js-modules opts js-sources compiler-env)
                  js-sources (-> js-sources

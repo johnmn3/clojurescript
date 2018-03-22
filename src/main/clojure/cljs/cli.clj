@@ -172,14 +172,54 @@ classpath. Classpath-relative paths have prefix of @ or @/")
   (let [target (if (= "node" target) "nodejs" target)]
     (assoc-in cfg [:options :target] (keyword target))))
 
+(defn missing-file [x]
+  (throw
+    (ex-info
+      (str "File " x " does not exist")
+      {:cljs.main/error :invalid-arg})))
+
+(defn missing-resource [x]
+  (throw
+    (ex-info
+      (str "Resource "
+        (if (string/starts-with? x "@/")
+          (subs x 2)
+          (subs x 1))
+        " does not exist")
+      {:cljs.main/error :invalid-arg})))
+
+(defn read-edn-opts [str]
+  (letfn [(read-rsrc [rsrc-str orig-str]
+            (if-let [rsrc (io/resource rsrc-str)]
+              (edn/read-string (slurp rsrc))
+              (missing-resource orig-str)))]
+    (cond
+     (string/starts-with? str "@/") (read-rsrc (subs str 2) str)
+     (string/starts-with? str "@") (read-rsrc (subs str 1) str)
+     :else
+     (let [f (io/file str)]
+       (if (.exists f)
+         (edn/read-string (slurp f))
+         (missing-file str))))))
+
+(defn load-edn-opts [str]
+  (reduce merge {} (map read-edn-opts (string/split str #":"))))
+
 (defn- repl-env-opts-opt
   [cfg ropts]
-  (update cfg :repl-env-options merge (edn/read-string ropts)))
+  (let [ropts (string/trim ropts)
+        edn   (if (string/starts-with? ropts "{")
+                (edn/read-string ropts)
+                (load-edn-opts ropts))]
+    (update cfg :repl-env-options merge edn)))
 
 (defn- compile-opts-opt
   [cfg copts]
-  (update cfg :options merge (edn/read-string copts)))
-
+  (let [copts (string/trim copts)
+        edn   (if (string/starts-with? copts "{")
+                (edn/read-string copts)
+                (load-edn-opts copts))]
+    (update cfg :options merge edn)))
 
 (defn- init-opt
   [cfg file]
@@ -192,19 +232,9 @@ classpath. Classpath-relative paths have prefix of @ or @/")
                 (let [f (io/file file)]
                   (if (.exists f)
                     f
-                    (throw
-                      (ex-info
-                        (str "File " file " does not exist")
-                        {:cljs.main/error :invalid-arg})))))]
+                    (missing-file file))))]
     (when-not file'
-      (throw
-        (ex-info
-          (str "Resource "
-               (if (string/starts-with? file "@/")
-                 (subs file 2)
-                 (subs file 1))
-               " does not exist")
-          {:cljs.main/error :invalid-arg})))
+      (missing-resource file))
     (update-in cfg [:inits]
       (fnil conj [])
       {:type :init-script
@@ -320,18 +350,12 @@ present"
                   (string/starts-with? script "@/")
                   (if-let [rsrc (io/resource (subs script 2))]
                     (repl/load-stream renv (util/get-name rsrc) rsrc)
-                    (throw
-                      (ex-info
-                        (str "Resource script " (subs script 2) " does not exist")
-                        {:cljs.main/error :invalid-arg})))
+                    (missing-resource script))
 
                   (string/starts-with? script "@")
                   (if-let [rsrc (io/resource (subs script 1))]
                     (repl/load-stream renv (util/get-name rsrc) rsrc)
-                    (throw
-                      (ex-info
-                        (str "Resource script " (subs script 1) " does not exist")
-                        {:cljs.main/error :invalid-arg})))
+                    (missing-resource script))
 
                   (string/starts-with? script "-")
                   (throw
@@ -403,8 +427,14 @@ present"
 
 (defn default-compile
   [repl-env {:keys [ns args options] :as cfg}]
-  (let [env-opts (repl/repl-options (repl-env))
-        main-ns  (symbol ns)
+  (let [rfs      #{"-r" "--repl"}
+        sfs      #{"-s" "--serve"}
+        env-opts (repl/repl-options (repl-env))
+        repl?    (boolean (or (rfs ns) (rfs (first args))))
+        serve?   (boolean (or (sfs ns) (sfs (first args))))
+        main-ns  (if (and ns (not ((into rfs sfs) ns)))
+                   (symbol ns)
+                   (:main options))
         coptsf   (when-let [od (:output-dir options)]
                    (io/file od "cljsc_opts.edn"))
         opts     (as->
@@ -412,11 +442,10 @@ present"
                      (when (and coptsf (.exists coptsf))
                        (edn/read-string (slurp coptsf)))
                      (select-keys env-opts
-                       (cond-> [:target]
-                         (not (:target options))
-                         (conj :browser-repl)))
+                       (cond-> [:target] repl? (conj :browser-repl)))
                      options
-                     {:main main-ns}) opts
+                     (when main-ns
+                       {:main main-ns})) opts
                    (cond-> opts
                      (not (:output-to opts))
                      (assoc :output-to
@@ -429,10 +458,8 @@ present"
                      (assoc :aot-cache true)))
         convey   (into [:output-dir] repl/known-repl-opts)
         cfg      (update cfg :options merge (select-keys opts convey))
-        source   (when (= :none (:optimizations opts :none))
+        source   (when (and (= :none (:optimizations opts :none)) main-ns)
                    (:uri (build/ns->location main-ns)))
-        repl?    (boolean (#{"-r" "--repl"} (first args)))
-        serve?   (boolean (#{"-s" "--serve"} (first args)))
         cenv     (env/default-compiler-env)]
     (env/with-compiler-env cenv
       (if-let [path (:watch opts)]
@@ -524,10 +551,14 @@ present"
                                      "webworker, none") }
       ["-ro" "--repl-opts"]    {:group ::main&compile :fn repl-env-opts-opt
                                 :arg "edn"
-                                :doc (str "Options to configure the repl-env")}
+                                :doc (str "Options to configure the repl-env, can be an EDN string or "
+                                          "colon separated list of EDN files / classpath resources. Options "
+                                          "will be merged left to right.")}
       ["-co" "--compile-opts"] {:group ::main&compile :fn compile-opts-opt
                                 :arg "edn"
-                                :doc (str "Options to configure the build")}}
+                                :doc (str "Options to configure the build, can be an EDN string or "
+                                          "colon separated list of EDN files / classpath resources. Options "
+                                          "will be merged left to right.")}}
      :main
      {["-r" "--repl"]          {:fn repl-opt
                                 :doc "Run a repl"}
@@ -535,9 +566,12 @@ present"
                                 :arg "ns"
                                 :doc "Call the -main function from a namespace with args"}
       ["-c" "--compile"]       {:fn compile-opt
-                                :arg "ns"
-                                :doc (str "Compile a namespace. If --repl present after "
-                                       "namespace will launch a REPL after the compile completes")}
+                                :arg "[ns]"
+                                :doc (str "Run a compile. If optional namespace specified, use as "
+                                          "the main entry point. If --repl follows, "
+                                          "will launch a REPL after the compile completes. "
+                                          "If --server follows, will start a web server that serves "
+                                          "the current directory after the compile completes.")}
       ["-s" "--serve"]         {:fn serve-opt
                                 :arg "host:port"
                                 :doc (str "Start a simple web server to serve the current directory")}
