@@ -19,13 +19,17 @@
             [clojure.browser.repl :as brepl]
             [cljs.reader :as reader :refer [read-string]]))
 
-(def ws-connection (atom nil))
+(def ws-conn (atom nil))
+(def last-repl (atom nil))
 
 (defn repl-print
   "Send data to be printed in the REPL"
   [& args]
-  (if-let [conn @ws-connection]
-    (net/transmit conn {:op :print :value (apply pr-str args)})))
+  (if-let [conn @ws-conn]
+    (net/transmit conn {:op :print
+                        :value {:status :success
+                                :repl @last-repl
+                                :value (apply pr-str args)}})))
 
 (defn console-print [& args]
   "Print data to the javascript console"
@@ -41,28 +45,31 @@
 (defn alive? []
   "Returns truthy value if the REPL is attempting to connect or is
    connected, or falsy value otherwise."
-  (not (nil? @ws-connection)))
+  (not (nil? @ws-conn)))
 
-(defmulti process-message
+(defmulti ws-msg
   "Process messages from WebSocket server"
-  {:arglists '([message])}
+  {:arglists '([msg])}
   :op)
 
-(defmethod process-message
+(defmethod ws-msg
   :error
-  [message]
-  (.error js/console (str "Websocket REPL error " (:type message))))
+  [msg]
+  (.error js/console (str "Websocket REPL error " (:type msg))))
 
-(defmethod process-message
+(defmethod ws-msg
   :eval-js
-  [message]
-  (let [code (:code message)]
+  [msg]
+  (let [{:keys [code repl]} msg]
+    (when repl (reset! last-repl repl))
     {:op :result
      :value (try
               {:status :success
+               :repl repl
                :value (str (js* "eval(~{code})"))}
               (catch :default e
                 {:status :exception
+                 :repl repl
                  :ua-product (brepl/get-ua-product)
                  :value (pr-str e)
                  :stacktrace (if (.hasOwnProperty e "stack")
@@ -73,30 +80,31 @@
   "Connects to a WebSocket REPL server from an HTML document. After the
   connection is made, the REPL will evaluate forms in the context of
   the document that called this function."
-  [repl-server-url & {:keys [verbose on-open on-error on-close print]
-                      :or {verbose false, print :repl}}]
-  (let [repl-connection (net/websocket-connection)]
-    (swap! ws-connection (constantly repl-connection))
-    (event/listen repl-connection :opened
+  [ws-url & {:keys [verbose on-open on-error on-close print]
+             :or {verbose false print :repl}}]
+  (let [repl (net/websocket-connection)]
+    (swap! ws-conn (constantly repl))
+    (event/listen repl :opened
       (fn [evt]
-        (set-print-fn! (if (fn? print) print (get print-fns print)))
+        (set-print-fn! repl-print #_ (if (fn? print) print (get print-fns print)))
         (set-print-err-fn! repl-print)
-        (net/transmit repl-connection (pr-str {:op :ready}))
+        (net/transmit repl (pr-str {:op :ready
+                                    :value {:status :success
+                                            :repl @last-repl}}))
         (when verbose (.info js/console "Opened Websocket REPL connection"))
         (when (fn? on-open) (on-open))))
-    (event/listen repl-connection :message
+    (event/listen repl :message
       (fn [evt]
-        (let [message (read-string (.-message evt))
-              response (-> message process-message pr-str)]
-          (net/transmit repl-connection response))))
-    (event/listen repl-connection :closed
+        (let [msg (read-string (.-message evt))
+              response (-> msg ws-msg pr-str)]
+          (net/transmit repl response))))
+    (event/listen repl :closed
       (fn [evt]
-        (reset! ws-connection nil)
+        (reset! ws-conn nil)
         (when verbose (.info js/console "Closed Websocket REPL connection"))
         (when (fn? on-close) (on-close))))
-    (event/listen repl-connection :error
+    (event/listen repl :error
       (fn [evt]
         (when verbose (.error js/console "WebSocket error" evt))
         (when (fn? on-error) (on-error evt))))
-    (brepl/bootstrap)
-    (net/connect repl-connection repl-server-url)))
+    (net/connect repl ws-url)))

@@ -7,10 +7,13 @@
 ;; You must not remove this notice, or any other, from this software.
 
 (ns cljs.repl.ws
-  (:require [cljs.repl]
-            [cljs.closure :as cljsc]
+  (:require [clojure.edn :as edn]
+            [clojure.string :as string]
+            [cljs.repl :as repl]
             [cljs.compiler :as cmp]
-            [cljs.env :as env])
+            [cljs.stacktrace :as st]
+            [cljs.util :as util]
+            [cljs.analyzer :as ana])
   (:import [java.nio ByteBuffer]
            [java.io BufferedReader IOException]
            [org.java_websocket.server WebSocketServer]))
@@ -19,22 +22,43 @@
 (defonce state
   (atom {:server nil
          :clients nil
-         :started nil}))
-(def repl-out (atom nil))
+         :get-next-client-id nil
+         :started nil
+         :repl->out nil
+         :repl->client nil}))
+
 (def response (atom nil))
 
 ;; utils
+(defn repl-id []
+  (if-let [kv (first (filter #(= *out* (val %)) (:repl->out @state)))]
+    (key kv)
+    (let [repl (.getName (Thread/currentThread))]
+      (swap! state assoc-in [:repl->out repl] *out*)
+      repl)))
+
+(defn current-client []
+  (or
+   (-> @state :repl->client (get (repl-id)))
+   1))
+
+(defn set-client! [client-id]
+  (let [repl (repl-id)]
+    (swap! state assoc-in [:repl->client repl] client-id)))
+
 (defn wait-for-client [] @(:started @state))
 
 (defn send!
   ([msg]
-   (if-let [ws (-> (:clients @state) first :ws)]
-     (send! ws msg)))
+   (if-let [ws (-> @state :clients (get (current-client)))]
+    (let [ws (or ws (-> @state :clients first val))]
+      (send! ws msg))))
   ([client msg]
    (.send client (pr-str msg))))
 
 (defn send-for-eval! [js]
-  (send! {:op :eval-js, :code js}))
+  (send! {:op :eval-js :code js :repl (repl-id)}))
+
 
 ;; impl
 (defn ws-server-impl [host port open error close str-msg bb-msg start]
@@ -54,18 +78,30 @@
       (when start
         (start)))))
 
+(defn on-open [{:keys [client]}]
+  (let [client-id ((-> @state :get-next-client-id))]
+    (doseq [out (-> @state :repl->out vals)]
+      (binding [*out* (or out *out*)]
+        (print (str "\nnew repl client: :repl.ws/=>" client-id
+                    "\n" ana/*cljs-ns* ":" (current-client) "=> "))
+        (.flush *out*)))
+    (-> (swap! state assoc-in [:clients client-id] client)
+        :started (deliver true))))
+
+(defn on-close [{:keys [client]}]
+  (let [clients (:clients @state)
+        client-id (filter (comp #{client} clients) (keys clients))]
+    (swap! state update :clients dissoc client-id)
+    (if (= client-id (current-client))
+      (set-client! (->@ state :clients ffirst)))))
+
 (defn server [host port & args]
   (let [{:keys [open error close str-msg bb-msg start]
-         :or {close (fn [{:keys [client]}]
-                      (swap! state update :clients #(remove #{client} %)))
-              open (fn [{:keys [client]}]
-                     (-> (swap! state update :clients conj
-                            {:ws client :id (gensym "client")})
-                      :started (deliver true)))
+         :or {open on-open
+              close on-close
               str-msg (fn [{:keys [msg]}] (println "from client:" msg))
               bb-msg str-msg
               error (fn [{:keys [client ex]}] (println client "sent error:" ex))}}
-
         (apply hash-map args)
         ws (ws-server-impl host port open error close str-msg bb-msg start)]
     (future (.run ws))
@@ -73,11 +109,12 @@
 
 ;; star/stop
 (defn start
-  [f & {:keys [ip port]}]
+  [f & {:keys [host port]}]
   {:pre [(ifn? f)]}
   (swap! state
-    assoc :server (server ip port :str-msg f)
-          :clients #{}
+    assoc :server (server host port :str-msg f)
+          :clients {}
+          :get-next-client-id (let [a (atom 0)] #(swap! a inc))
           :started (promise)))
 
 (defn stop []
@@ -85,14 +122,14 @@
     (when-not (nil? stop-server)
       (.stop stop-server)
       (reset! state {:server nil
+                     :get-next-client-id nil
                      :clients nil
-                     :started nil})
+                     :started nil
+                     :repl->out nil
+                     :repl->client nil})
       @state)))
 
-#_
-(declare send-for-eval! websocket-setup-env websocket-eval load-javascript
-  websocket-tear-down-env transitive-deps)
-
+;; msg handling
 (defmulti ws-msg
  "Process msgs from client"
  {:arglists '([_ msg])}
@@ -100,37 +137,41 @@
 
 (defmethod ws-msg
   :result
-  [_ msg]
-  (let [result (:value msg)]
-    (when-not (nil? @response)
-      (deliver @response result))))
+  [_ {:keys [value]}]
+  (when-not (nil? @response)
+    (deliver @response value)))
 
 (defmethod ws-msg
   :print
   [_ msg]
-  (let [string (:value msg)]
-    (binding [*out* (or @repl-out *out*)]
-      (print (read-string string)))))
+  (let [{:keys [value repl]} (:value msg)]
+    (when (= repl (repl-id))
+      (binding [*out* (or (-> @state :repl->out (get repl)) *out*)]
+        (print (read-string value))))))
 
 (defmethod ws-msg
   :ready
-  [_ _]
+  [_ msg]
   (when-not (nil? @response)
     (deliver @response :ready)))
 
 ;; IJavaScriptEnv implementation
 (defn websocket-setup-env
   [this opts]
-  (reset! repl-out *out*)
-  (start (fn [data] (ws-msg this (read-string (:msg data))))
-         :ip (:ip this)
-         :port (:port this))
-  (let [{:keys [ip pre-connect]} this]
-    (println (str "Waiting for connection at "
-                  "ws://" ip ":" (:port this) " ..."))
-    (when pre-connect (pre-connect))
-    (wait-for-client)
-    nil))
+  (when-not (-> this :server-state deref :server)
+    (start (fn [data] (ws-msg this (read-string (:msg data))))
+           :host (:host this)
+           :port (:port this))
+    (update-in this [:server-state] #(swap! % assoc :server (:server @state)))
+    (let [{:keys [host pre-connect]} this]
+      (println (str "Waiting for connection at "
+                    "ws://" host ":" (:port this) " ..."))
+      (when pre-connect (pre-connect))
+      (wait-for-client)))
+  (swap! state assoc-in [:repl->out (repl-id)] *out*)
+  (swap! (:server-state this) update :listeners inc)
+  (set-client! (-> @state :clients ffirst))
+  nil)
 
 (defn websocket-eval
   [js]
@@ -146,22 +187,83 @@
     (str "goog.require('" (cmp/munge (first provides)) "')")))
 
 (defn websocket-tear-down-env
-  []
-  (reset! repl-out nil)
-  (stop)
-  (println "<< stopped server >>"))
+  [ws-env]
+  (let [server-state (:server-state ws-env)]
+    (when (zero? (:listeners (swap! server-state update :listeners dec)))
+      (swap! state update :repl->out dissoc (repl-id))
+      (stop)
+      (println "<< stopped server >>"))))
 
 (defrecord WebsocketEnv []
   cljs.repl/IJavaScriptEnv
   (-setup [this opts] (websocket-setup-env this opts))
   (-evaluate [_ _ _ js] (websocket-eval js))
   (-load [this ns url] (load-javascript this ns url))
-  (-tear-down [_] (websocket-tear-down-env)))
+  (-tear-down [ws-env] (websocket-tear-down-env ws-env))
+  repl/IReplEnvOptions
+  (-repl-options [this]
+    {:browser-repl true
+     :repl-requires
+     '[[clojure.browser.ws] [clojure.browser.repl] [clojure.browser.repl.preload]]
+     :cljs.cli/commands
+     {:groups {::repl {:desc "websocket REPL options"}}
+      :init
+      {["-H" "--host"]
+       {:group ::repl :fn #(assoc-in %1 [:repl-env-options :host] %2)
+        :arg "address"
+        :doc "Address to bind"}
+       ["-p" "--port"]
+       {:group ::repl :fn #(assoc-in %1 [:repl-env-options :port] (Integer/parseInt %2))
+        :arg "number"
+        :doc "Port to bind"}}}})
+  repl/IParseStacktrace
+  (-parse-stacktrace [this st err opts]
+    (st/parse-stacktrace this st err opts))
+  repl/IGetError
+  (-get-error [this e env opts]
+    (edn/read-string
+      (repl/evaluate-form this env "<cljs ws repl>"
+        `(when ~e
+           (pr-str
+             {:ua-product (clojure.browser.repl/get-ua-product)
+              :value (str ~e)
+              :stacktrace (.-stack ~e)}))))))
+
+(defn repl-env*
+  [{:keys [output-dir host port] :or {host "localhost" port 9001} :as opts}]
+  (merge (WebsocketEnv.)
+    {:host host
+     :port port
+     :launch-browser false
+     :working-dir (->> [".repl" (util/clojurescript-version)]
+                       (remove empty?) (string/join "-"))
+     :static-dir (cond-> ["." "out/"] output-dir (conj output-dir))
+     :preloaded-libs []
+     :src "src/"
+     ; :browser-state (atom {:return-value-fn nil
+     ;                       :client-js nil})
+     ; :ordering (agent {:expecting nil :fns {}})
+     :server-state
+     (atom
+       {:server nil
+        :listeners 0})}
+    opts))
 
 (defn repl-env
-  "Returns a JS environment to pass to repl or piggieback"
+  "Create a websocket-connected REPL environment.
+
+  Options:
+
+  port:             The port on which the REPL server will run. Defaults to 9000.
+  launch-websocket: A Boolean indicating whether a browser should be automatically
+                    launched connecting back to the terminal REPL. Defaults to true.
+  working-dir:      The directory where the compiled REPL client JavaScript will
+                    be stored. Defaults to \".repl\" with a ClojureScript version
+                    suffix, eg. \".repl-0.0-2138\".
+  static-dir:       List of directories to search for static content. Defaults to
+                    [\".\" \"out/\"].
+  src:              The source directory containing user-defined cljs files. Used to
+                    support reflection. Defaults to \"src/\".
+  "
   [& {:as opts}]
-  (merge (WebsocketEnv.)
-    {:ip "127.0.0.1"
-     :port 9001}
-    opts))
+  (repl-env* opts))
