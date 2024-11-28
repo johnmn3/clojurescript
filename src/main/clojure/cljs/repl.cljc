@@ -1073,7 +1073,6 @@
           {:def-emits-var true}
           (cljsc/add-implicit-options
             (merge-with (fn [a b] (if (nil? b) a b))
-              repl-opts
               opts
               {:prompt prompt
                :need-prompt need-prompt
@@ -1083,7 +1082,8 @@
                :caught caught
                :reader reader
                :print-no-newline print-no-newline
-               :source-map-inline source-map-inline})))
+               :source-map-inline source-map-inline}
+              repl-opts)))
         done? (atom false)]
     (env/with-compiler-env (or compiler-env env/*compiler* (env/default-compiler-env opts))
      (when (:source-map opts)
